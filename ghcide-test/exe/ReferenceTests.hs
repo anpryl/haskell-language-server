@@ -177,6 +177,16 @@ tests = testGroup "references"
                           , ("Fields.hs", 13, 14)
                           , ("Main.hs", 16, 24)
                           ]
+
+          -- FieldsOrderUse.hs constructs a Rec before it uses the selector recB, so the
+          -- references to recB there must not depend on which of the two comes first
+          , referenceTest "references record fields used after a record construction"
+                          ("FieldsOrder.hs", 2, 31)
+                          YesIncludeDeclaration
+                          [ ("FieldsOrder.hs", 2, 31)
+                          , ("FieldsOrderUse.hs", 5, 36)
+                          , ("FieldsOrderUse.hs", 6, 17)
+                          ]
           ]
     ]
 

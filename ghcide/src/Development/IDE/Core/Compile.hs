@@ -119,6 +119,10 @@ import           GHC.Driver.Env                               (runHsc')
 import           GHC.Driver.Main                              (hscDesugar', hscSimplify')
 import           GHC.Iface.Ext.Types                          (HieASTs)
 import qualified GHC.Runtime.Loader                           as Loader
+import qualified GHC.Iface.Ext.Types                          as Hie
+import qualified GHC.Types.Avail                              as Avail
+import qualified GHC.Types.Name                               as Name
+import qualified GHC.Types.Name.Env                           as NameEnv
 import           GHC.Tc.Gen.Splice
 import           GHC.Types.Error
 import           GHC.Types.ForeignStubs
@@ -967,7 +971,7 @@ indexHieFile se mod_summary srcPath !hash hf = do
     Just pendingHash | pendingHash == hash -> pure () -- An index is already scheduled
     _ -> do
       -- hiedb doesn't use the Haskell src, so we clear it to avoid unnecessarily keeping it around
-      let !hf' = hf{hie_hs_src = mempty}
+      let !hf' = canonicaliseHieNames hf{hie_hs_src = mempty}
       modifyTVar' indexPending $ HashMap.insert srcPath hash
       writeTaskQueue indexQueue $ \withHieDb -> do
         -- We are now in the worker thread
@@ -1004,6 +1008,36 @@ indexHieFile se mod_summary srcPath !hash hf = do
           LSP.sendNotification (LSP.SMethod_CustomMethod (Proxy @"ghcide/reference/ready")) $
             toJSON $ fromNormalizedFilePath srcPath
       whenJust mdone $ \_ -> progressUpdate indexProgressReporting ProgressCompleted
+
+-- | Replace every internal 'Name' in a 'HieFile' that shares its unique with an
+-- external 'Name' of the same file by that external 'Name'.
+--
+-- GHC's typechecker gives each field of a record construction or update a local
+-- 'Id' with the unique of the field's selector (see @tcRecordField@ in
+-- "GHC.Tc.Gen.Expr"), so a 'HieFile' made from a typechecked module can hold both.
+-- Writing the file merges them, as its symbol table is keyed by unique, but
+-- 'indexHieFile' is given the 'HieFile' still in memory. hiedb's references map,
+-- also keyed by unique, keeps whichever 'Name' it meets first, and when that is the
+-- internal one it records no reference to the field anywhere in the module: a
+-- record construction before the first use of a field's selector hides every use
+-- of that field in the module from find-references and rename.
+canonicaliseHieNames :: Compat.HieFile -> Compat.HieFile
+canonicaliseHieNames hf = hf { Hie.hie_asts = Hie.HieASTs (fmap goAst asts) }
+  where
+    asts = Hie.getAsts (Hie.hie_asts hf)
+    externals = NameEnv.mkNameEnv
+      [ (n, n)
+      | n <- concatMap astNames (Map.elems asts) ++ concatMap Avail.availNames (Hie.hie_exports hf)
+      , Name.isExternalName n ]
+    astNames (Hie.Node sni _ kids) =
+      [ n | ni <- Map.elems (Hie.getSourcedNodeInfo sni), Right n <- Map.keys (Hie.nodeIdentifiers ni) ]
+      ++ concatMap astNames kids
+    canonical (Right n)
+      | not (Name.isExternalName n), Just e <- NameEnv.lookupNameEnv externals n = Right e
+    canonical ident = ident
+    goAst (Hie.Node sni sp kids) =
+      Hie.Node (Hie.SourcedNodeInfo (fmap goInfo (Hie.getSourcedNodeInfo sni))) sp (map goAst kids)
+    goInfo ni = ni { Hie.nodeIdentifiers = Map.mapKeysWith (<>) canonical (Hie.nodeIdentifiers ni) }
 
 writeAndIndexHieFile
   :: HscEnv -> ShakeExtras -> ModSummary -> NormalizedFilePath -> [GHC.AvailInfo]
