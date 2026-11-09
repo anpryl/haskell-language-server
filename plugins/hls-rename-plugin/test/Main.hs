@@ -7,8 +7,10 @@ module Main (main) where
 import           Control.Lens                ((^.))
 import           Data.Aeson                  (KeyValue ((.=)))
 import           Data.Functor                (void)
+import           Data.Maybe                  (mapMaybe)
 import qualified Data.Map                    as M
 import           Data.Text                   (Text, pack)
+import qualified Data.Text                   as T
 import qualified Data.Text.IO                as TIO
 import           Development.IDE.Test        (referenceReady)
 import           Ide.Plugin.Config
@@ -96,21 +98,21 @@ renameTests = testGroup "Identifier"
     , goldenWithRename "GADT" "Gadt" $ \doc ->
         rename doc (Position 6 37) "Expr"
     , goldenWithRename "Hidden function" "HiddenFunction" $ \doc ->
-        rename doc (Position 0 32) "quux"
+        rename doc (Position 2 32) "quux"
     , goldenWithRename "Imported function" "ImportedFunction" $ \doc ->
-        rename doc (Position 3 8) "baz"
+        rename doc (Position 5 8) "baz"
     , goldenWithRename "Import hiding" "ImportHiding" $ \doc ->
-        rename doc (Position 0 22) "hiddenFoo"
+        rename doc (Position 2 22) "hiddenFoo"
     , goldenWithRename "Indirect Puns" "IndirectPuns" $ \doc ->
         rename doc (Position 4 23) "blah"
     , goldenWithRename "Let expression" "LetExpression" $ \doc ->
         rename doc (Position 5 11) "foobar"
     , goldenWithRename "Qualified as" "QualifiedAs" $ \doc ->
-        rename doc (Position 3 10) "baz"
+        rename doc (Position 5 10) "baz"
     , goldenWithRename "Qualified shadowing" "QualifiedShadowing" $ \doc ->
-        rename doc (Position 3 12) "foobar"
+        rename doc (Position 5 12) "foobar"
     , goldenWithRename "Qualified function" "QualifiedFunction" $ \doc ->
-        rename doc (Position 3 12) "baz"
+        rename doc (Position 5 12) "baz"
     , goldenWithRename "Realigns do block indentation" "RealignDo" $ \doc ->
         rename doc (Position 0 2) "fooBarQuux"
     , goldenWithRename "Record field" "RecordField" $ \doc ->
@@ -180,6 +182,17 @@ crossModuleTests =
             rename defDoc (Position 3 0) "succInt"
             assertGolden "CrossModuleDefinition" defDoc
             assertGolden "CrossModuleUsage" useDoc
+        -- The project is not checked and UseA.hs is not open, so nothing indexes
+        -- UseA.hs before the rename does
+        , testCase "Indexes a module using the name before renaming it" $ runRenameSession "importers" $ do
+            defDoc <- openDoc "DefA.hs" "haskell"
+            edit <- renameEdit defDoc (Position 3 0) "renamedA"
+            liftIO $ assertBool "UseA.hs is edited" $ "UseA.hs" `elem` editedFiles edit
+        , testCase "Fails when a module using the name does not compile" $ runRenameSession "importers" $ do
+            defDoc <- openDoc "DefB.hs" "haskell"
+            renameErr <- expectRenameError defDoc (Position 3 0) "renamedB"
+            liftIO $ assertBool (show renameErr) $
+                "UseB.hs, which may not compile" `T.isSuffixOf` (renameErr ^. L.message)
         ]
   where
     assertGolden path doc = do
@@ -200,7 +213,7 @@ crossModuleDisabledTests =
         , refused exported "Duplicate record field exported through (..)" "ExportedFieldsDRF" (Position 3 23)
         , refused exported "Name exported through module M" "ExportedModule" (Position 2 0)
         , refused exported "Name exported by name" "ExportedFunction" (Position 2 0)
-        , refused "Renaming of an imported name is unsupported" "Imported name" "ImportedFunction" (Position 3 6)
+        , refused "Renaming of an imported name is unsupported" "Imported name" "ImportedFunction" (Position 5 6)
         , refused "Explicit export list required for renaming" "Module without export list" "Foo" (Position 2 0)
         , goldenWithHaskellDoc crossModuleOff renamePlugin "Name not exported" testDataDir "ExportedNames" "expected" "hs" $ \doc ->
             rename doc (Position 26 0) "factor"
@@ -288,6 +301,18 @@ renameExpectError expectedError doc pos newName = do
   case rsp ^. L.result of
     Right _ -> liftIO $ assertFailure $ "Was expecting " <> show expectedError <> ", got success"
     Left actualError -> liftIO $ assertEqual "ResponseError" expectedError actualError
+
+renameEdit :: TextDocumentIdentifier -> Position -> Text -> Session WorkspaceEdit
+renameEdit doc pos newName = do
+  rsp <- request SMethod_TextDocumentRename $ RenameParams Nothing doc pos newName
+  case rsp ^. L.result of
+    Right (InL edit) -> pure edit
+    other -> liftIO $ assertFailure $ "Expected a rename edit, got " <> show other
+
+editedFiles :: WorkspaceEdit -> [FilePath]
+editedFiles edit = mapMaybe (fmap takeFileName . uriToFilePath) $
+    maybe [] M.keys (edit ^. L.changes)
+    ++ [ tde ^. L.textDocument . L.uri | Just changes <- [edit ^. L.documentChanges], InL tde <- changes ]
 
 testDataDir :: FilePath
 testDataDir = "plugins" </> "hls-rename-plugin" </> "test" </> "testdata"

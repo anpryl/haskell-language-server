@@ -1,3 +1,5 @@
+module QualifiedFunction where
+
 import qualified Foo
 
 bar :: Int -> Int
