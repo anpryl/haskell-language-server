@@ -1,3 +1,5 @@
+module QualifiedShadowing where
+
 import qualified Foo as F
 
 bar :: Int -> Int

@@ -1,3 +1,5 @@
+module HiddenFunction where
+
 import           Foo hiding (foo)
 
 foo :: Int -> Int
