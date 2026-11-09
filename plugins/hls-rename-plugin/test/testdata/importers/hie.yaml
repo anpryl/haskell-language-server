@@ -1,0 +1,7 @@
+cradle:
+  direct:
+    arguments:
+      - "DefA"
+      - "UseA"
+      - "DefB"
+      - "UseB"

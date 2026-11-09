@@ -21,6 +21,7 @@ import           Data.Foldable                         (fold, minimumBy)
 import           Data.Generics
 import           Data.Hashable
 import           Data.HashSet                          (HashSet)
+import qualified Data.HashMap.Strict                   as HM
 import qualified Data.HashSet                          as HS
 import qualified Data.List                             as List
 import           Data.List.NonEmpty                    (NonEmpty ((:|)),
@@ -32,6 +33,7 @@ import           Data.Maybe
 import           Data.Mod.Word
 import           Data.Ord                              (comparing)
 import qualified Data.Text                             as T
+import           Development.IDE                       (printOutputable)
 import           Development.IDE.Core.FileStore        (getVersionedTextDoc)
 import           Development.IDE.Core.PluginUtils
 import           Development.IDE.Core.Rules            (usePropertyAction)
@@ -43,10 +45,14 @@ import           Development.IDE.GHC.Compat.ExactPrint
 import           Development.IDE.GHC.Error
 import           Development.IDE.GHC.ExactPrint        hiding (Log)
 import qualified Development.IDE.GHC.ExactPrint        as E
+import           Development.IDE.Import.DependencyInformation (lookupModuleFile,
+                                                        transitiveReverseDependencies)
 import           Development.IDE.Plugin.CodeAction
 import           Development.IDE.Spans.AtPoint
 import           Development.IDE.Types.HscEnvEq        (HscEnvEq (hscEnv))
 import           Development.IDE.Types.Location
+import           GHC.Conc                              (atomically, readTVar,
+                                                        retry)
 import           GHC.Iface.Ext.Types                   (HieAST (..),
                                                         HieASTs (..),
                                                         NodeOrigin (..),
@@ -54,7 +60,9 @@ import           GHC.Iface.Ext.Types                   (HieAST (..),
 import           GHC.Iface.Ext.Utils                   (generateReferencesMap)
 import           HieDb                                 ((:.) (..))
 import           HieDb.Query
-import           HieDb.Types                           (RefRow (refIsGenerated))
+import           HieDb.Types                           (HieModuleRow (hieModInfo),
+                                                        ModuleInfo (modInfoSrcFile),
+                                                        RefRow (refIsGenerated, refNameUnit))
 import           Ide.Logger
 import           Ide.Plugin.Error
 import           Ide.Plugin.Properties
@@ -148,7 +156,9 @@ renameModuleProvider recorder state _ (RenameFilesParams renames) = do
 renameProvider :: PluginMethodHandler IdeState Method_TextDocumentRename
 renameProvider state pluginId (RenameParams _prog (TextDocumentIdentifier uri) pos newNameText) = do
     nfp <- getNormalizedFilePathE uri
+    crossModuleEnabled <- liftIO $ runAction "rename: config" state $ usePropertyAction #crossModule pluginId properties
     directOldNames <- getNamesAtPos state nfp pos
+    when crossModuleEnabled $ failWhenIndexIncomplete state nfp directOldNames
     directRefs <- concat <$> mapM (refsAtName state nfp) directOldNames
 
     {- References in HieDB are not necessarily transitive. With `NamedFieldPuns`, we can have
@@ -169,7 +179,6 @@ renameProvider state pluginId (RenameParams _prog (TextDocumentIdentifier uri) p
             refs <- HS.fromList . concat <$> mapM (refsAtName state nfp) oldNames
 
             -- Validate rename
-            crossModuleEnabled <- liftIO $ runAction "rename: config" state $ usePropertyAction #crossModule pluginId properties
             unless crossModuleEnabled $ failWhenImportOrExport state nfp oldNames
             when (any isBuiltInSyntax oldNames) $ throwError $ PluginInternalError "Invalid rename of built-in syntax"
 
@@ -204,6 +213,60 @@ failWhenImportOrExport state nfp names = do
         _ | any (`elem` exportedNames) names
             -> throwError $ PluginInternalError "Renaming of an exported name is unsupported"
         _ -> pure ()
+
+-- | A cross-module rename takes the references outside the current file from
+-- hiedb, so they are complete only if hiedb has every module that can refer to
+-- the name: the project module defining it, and the project modules importing
+-- that one, directly or not. Typecheck those that are not indexed yet, which
+-- indexes them, and refuse the rename if some are still missing because they
+-- do not compile.
+--
+-- The stack cradle loads each component in a session of its own. A library is a
+-- home unit with a generated id in its own session, but an installed package in
+-- the sessions of the components using it, so their references carry the
+-- package's unit and the lookup by unit in 'refsAtName' misses all of them.
+-- Refuse when the name's module is recorded under another unit as well.
+failWhenIndexIncomplete ::
+    IdeState ->
+    NormalizedFilePath ->
+    [Name] ->
+    ExceptT PluginError (HandlerM config) ()
+failWhenIndexIncomplete state nfp names = do
+    extras@ShakeExtras{withHieDb} <- liftIO $ runAction "Rename.HieDb" state getShakeExtras
+    HAR{hieModule} <- handleGetHieAst state nfp
+    graph <- liftIO $ runAction "Rename.GetModuleGraph" state $ useNoFile_ GetModuleGraph
+    let projectFile mod
+            | mod == hieModule = Just nfp
+            | otherwise = lookupModuleFile mod graph
+        files = HS.toList $ HS.delete nfp $ HS.fromList
+            [ f
+            | Just file <- map projectFile (mapMaybe nameModule_maybe names)
+            , f <- file : fromMaybe [] (transitiveReverseDependencies file graph)
+            ]
+        unindexed = liftIO $ do
+            indexed <- withHieDb $ \hieDb ->
+                HS.fromList . mapMaybe (modInfoSrcFile . hieModInfo) <$> getAllIndexedMods hieDb
+            pure $ filter (not . (`HS.member` indexed) . fromNormalizedFilePath) files
+    missing <- unindexed
+    unless (null missing) $
+        void $ liftIO $ runAction "Rename.IndexDependents" state $ uses GetModIface missing
+    -- Wait for the writes still queued for these files, the ones just started included
+    liftIO $ atomically $ do
+        pending <- readTVar $ indexPending $ hiedbWriter extras
+        when (any (`HM.member` pending) files) retry
+    unindexed >>= \case
+        [] -> pure ()
+        stillMissing@(f : _) -> throwError $ PluginInternalError $
+            "Cannot rename across modules: " <> T.pack (show (length stillMissing))
+            <> " module(s) that can use the name are not indexed, such as "
+            <> T.pack (fromNormalizedFilePath f) <> ", which may not compile"
+    forM_ names $ \name -> forM_ (nameModule_maybe name) $ \mod -> do
+        rows <- liftIO $ withHieDb $ \hieDb ->
+            findReferences hieDb True (nameOccName name) (Just $ moduleName mod) Nothing []
+        unless (all (\(row :. _) -> refNameUnit row == moduleUnit mod) rows) $
+            throwError $ PluginInternalError $
+                "Cannot rename across modules: references to " <> printOutputable name
+                <> " are recorded under more than one unit"
 
 ---------------------------------------------------------------------------------------------------
 -- Source renaming
