@@ -132,7 +132,7 @@ renameProvider state pluginId (RenameParams _prog (TextDocumentIdentifier uri) p
 
             -- Validate rename
             crossModuleEnabled <- liftIO $ runAction "rename: config" state $ usePropertyAction #crossModule pluginId properties
-            unless crossModuleEnabled $ failWhenImportOrExport state nfp refs oldNames
+            unless crossModuleEnabled $ failWhenImportOrExport state nfp oldNames
             when (any isBuiltInSyntax oldNames) $ throwError $ PluginInternalError "Invalid rename of built-in syntax"
 
             -- Perform rename
@@ -148,19 +148,23 @@ renameProvider state pluginId (RenameParams _prog (TextDocumentIdentifier uri) p
 failWhenImportOrExport ::
     IdeState ->
     NormalizedFilePath ->
-    HashSet Location ->
     [Name] ->
     ExceptT PluginError (HandlerM config) ()
-failWhenImportOrExport state nfp refLocs names = do
+failWhenImportOrExport state nfp names = do
     pm <- runActionE "Rename.GetParsedModule" state
          (useE GetParsedModule nfp)
+    tmr <- runActionE "Rename.TypeCheck" state
+         (useE TypeCheck nfp)
     let hsMod = unLoc $ pm_parsed_source pm
+        -- The names the module exports, however its export list mentions them: `T (..)`, `T (x, y)`
+        -- and `module M` have no export item for each name they export.
+        exportedNames = concatMap availNamesWithFields $ tcg_exports $ tmrTypechecked tmr
     case (unLoc <$> hsmodName hsMod, hsmodExports hsMod) of
         (mbModName, _) | not $ any (\n -> nameIsLocalOrFrom (replaceModName n mbModName) n) names
             -> throwError $ PluginInternalError "Renaming of an imported name is unsupported"
-        (_, Just (L _ exports)) | any ((`HS.member` refLocs) . unsafeSrcSpanToLoc . getLoc) exports
-            -> throwError $ PluginInternalError "Renaming of an exported name is unsupported"
         (Just _, Nothing) -> throwError $ PluginInternalError "Explicit export list required for renaming"
+        _ | any (`elem` exportedNames) names
+            -> throwError $ PluginInternalError "Renaming of an exported name is unsupported"
         _ -> pure ()
 
 ---------------------------------------------------------------------------------------------------
@@ -314,6 +318,15 @@ locToFilePos (Location uri (Range pos _)) = (,pos) <$> getNormalizedFilePathE ur
 replaceModName :: Name -> Maybe ModuleName -> Module
 replaceModName name mbModName =
     mkModule (moduleUnit $ nameModule name) (fromMaybe (mkModuleName "Main") mbModName)
+
+-- | Every name an 'AvailInfo' makes available, record field selectors included.
+availNamesWithFields :: AvailInfo -> [Name]
+availNamesWithFields =
+#if MIN_VERSION_ghc(9,7,0)
+    availNames
+#else
+    availNamesWithSelectors
+#endif
 
 ---------------------------------------------------------------------------------------------------
 -- Config

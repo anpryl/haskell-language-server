@@ -30,6 +30,7 @@ tests = testGroup "Rename"
     , renameTests
     , moduleNameTests
     , crossModuleTests
+    , crossModuleDisabledTests
     ]
 
 prepareRenameTests :: TestTree
@@ -185,6 +186,35 @@ crossModuleTests =
         actual <- documentContents doc
         expected <- liftIO $ TIO.readFile (testDataDir </> path <.> "expected" <.> "hs")
         liftIO $ assertEqual path expected actual
+
+crossModuleDisabledTests :: TestTree
+crossModuleDisabledTests =
+    testGroup
+        "CrossModule disabled"
+        [ refused exported "Type exported through (..)" "ExportedNames" (Position 10 5)
+        , refused exported "Data constructor exported through (..)" "ExportedNames" (Position 10 13)
+        , refused exported "Class method exported through (..)" "ExportedNames" (Position 13 4)
+        , refused exported "Record field exported through (..)" "ExportedNames" (Position 15 23)
+        , refused exported "Record field listed in T (x, y)" "ExportedNames" (Position 17 19)
+        , refused exported "Pattern synonym" "ExportedNames" (Position 19 8)
+        , refused exported "Duplicate record field exported through (..)" "ExportedFieldsDRF" (Position 3 23)
+        , refused exported "Name exported through module M" "ExportedModule" (Position 2 0)
+        , refused exported "Name exported by name" "ExportedFunction" (Position 2 0)
+        , refused "Renaming of an imported name is unsupported" "Imported name" "ImportedFunction" (Position 3 6)
+        , refused "Explicit export list required for renaming" "Module without export list" "Foo" (Position 2 0)
+        , goldenWithHaskellDoc crossModuleOff renamePlugin "Name not exported" testDataDir "ExportedNames" "expected" "hs" $ \doc ->
+            rename doc (Position 26 0) "factor"
+        ]
+  where
+    crossModuleOff = def { plugins = M.fromList [("rename", def { plcConfig = "crossModule" .= False })] }
+    exported = "Renaming of an exported name is unsupported"
+    refused reason title path pos = testCase title $ runSessionWithServer crossModuleOff renamePlugin testDataDir $ do
+        doc <- openDoc (path <.> "hs") "haskell"
+        let expectedError = TResponseError
+                (InR ErrorCodes_InternalError)
+                ("rename: Internal Error: " <> reason)
+                Nothing
+        renameExpectError expectedError doc pos "renamed"
 
 moduleNameTests :: TestTree
 moduleNameTests =
